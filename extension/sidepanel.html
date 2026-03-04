@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aegis Quant Co-Pilot</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header card">
+        <div class="symbol-row">
+          <h1 id="symbol-text">--</h1>
+          <span id="market-status" class="pill neutral">UNKNOWN</span>
+        </div>
+        <div class="price-row">
+          <span id="live-price">0.00</span>
+          <span id="session-warning">Waiting for session status...</span>
+        </div>
+      </header>
+
+      <section class="card signal-card">
+        <div class="banner-row">
+          <div id="signal-banner" class="signal neutral">AVOID</div>
+          <div class="meter-wrap">
+            <svg viewBox="0 0 120 120" class="meter">
+              <circle cx="60" cy="60" r="52" class="meter-track"></circle>
+              <circle cx="60" cy="60" r="52" class="meter-progress" id="meter-progress"></circle>
+            </svg>
+            <span id="conviction-text">0%</span>
+          </div>
+        </div>
+        <div class="signal-meta">
+          <div id="signal-change" class="signal-chip neutral">Signal Watch: waiting for first analysis.</div>
+          <div id="last-updated" class="tiny">Updated: --</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Trade Card</h2>
+        <div class="trade-grid">
+          <div><label>Entry</label><strong id="entry">--</strong></div>
+          <div><label>Stop Loss</label><strong id="sl" class="sl">--</strong></div>
+          <div><label>Target 1</label><strong id="t1" class="t1">--</strong></div>
+          <div><label>Target 2</label><strong id="t2" class="t2">--</strong></div>
+          <div><label>Target 3</label><strong id="t3" class="t3">--</strong></div>
+          <div><label>RRR</label><strong id="rrr">--</strong></div>
+          <div><label>Qty</label><strong id="qty">--</strong></div>
+          <div><label>Risk Budget</label><strong id="risk-budget">--</strong></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Conviction Breakdown</h2>
+        <div class="mini-bars" id="breakdown-bars"></div>
+      </section>
+
+      <section class="card">
+        <h2>Kill Switch Status</h2>
+        <div id="kill-switch-list" class="status-grid"></div>
+      </section>
+
+      <section class="card">
+        <h2>Agent Status</h2>
+        <div id="agent-leds" class="status-grid"></div>
+      </section>
+
+      <section class="card">
+        <h2>No-Trade Reasons</h2>
+        <div id="no-trade-reasons" class="reason-list"></div>
+      </section>
+
+      <details class="card" open>
+        <summary>Detected Patterns</summary>
+        <div id="patterns-list" class="list"></div>
+      </details>
+
+      <details class="card" open>
+        <summary>Key Levels</summary>
+        <div id="levels-list" class="list"></div>
+      </details>
+
+      <details class="card" open>
+        <summary>News Feed</summary>
+        <div id="news-list" class="list"></div>
+      </details>
+
+      <details class="card" open>
+        <summary>Options Data</summary>
+        <div id="options-list" class="list"></div>
+      </details>
+
+      <details class="card" open>
+        <summary>Groq Rationale</summary>
+        <div id="rationale-list" class="list"></div>
+      </details>
+
+      <details class="card" open>
+        <summary>Signal Change Log</summary>
+        <div id="signal-history-list" class="list"></div>
+      </details>
+
+      <section class="card actions">
+        <div class="actions-head">
+          <h2>Actions</h2>
+          <button id="download-csv-btn" class="icon-btn" title="Download complete transparency CSV" aria-label="Download complete transparency CSV">
+            <span class="icon">⬇</span>
+            <span>CSV</span>
+          </button>
+        </div>
+        <div class="button-row">
+          <button id="analyze-btn" class="btn primary">Analyze</button>
+          <button id="quick-scan-btn" class="btn">Quick Scan</button>
+          <button id="screenshot-btn" class="btn">Screenshot Analysis</button>
+        </div>
+        <div id="scan-output" class="small"></div>
+      </section>
+
+      <section id="loading-skeleton" class="card skeleton hidden">
+        <div class="s-line"></div>
+        <div class="s-line w80"></div>
+        <div class="s-line w60"></div>
+      </section>
+    </main>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

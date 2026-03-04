@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Aegis Quant Co-Pilot",
+  "version": "1.0.0",
+  "description": "AI Trading Agent for NSE/BSE with transparent multi-agent analysis.",
+  "permissions": ["activeTab", "storage", "sidePanel", "tabs"],
+  "host_permissions": [
+    "*://*.tradingview.com/*",
+    "*://*.zerodha.com/*",
+    "*://*.upstox.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Aegis Quant Co-Pilot"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.tradingview.com/*",
+        "*://*.zerodha.com/*",
+        "*://*.upstox.com/*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+yfinance
+pandas-ta-classic
+feedparser
+httpx
+python-dotenv
+groq
+transformers
+torch
+pandas
+numpy
+websockets
+praw
+requests

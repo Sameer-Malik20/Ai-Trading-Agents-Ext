@@ -1,0 +1,72 @@
+# ------------------------------
+# Secrets and local config
+# ------------------------------
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# ------------------------------
+# Python
+# ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+backend/.venv/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Build/distribution
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ------------------------------
+# Runtime outputs
+# ------------------------------
+*.log
+logs/
+backend/trading_agent.log
+backend/server.out.log
+backend/server.err.log
+backend/analysis_history.csv
+
+# ------------------------------
+# Jupyter / notebooks
+# ------------------------------
+.ipynb_checkpoints/
+
+# ------------------------------
+# OS / Editor
+# ------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
