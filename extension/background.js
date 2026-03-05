@@ -132,7 +132,9 @@ async function handleMarketOverview() {
 }
 
 async function handleScreenshotAnalysis(payload) {
-  const capture = await chrome.tabs.captureVisibleTab(undefined, { format: "png" });
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const windowId = typeof activeTab?.windowId === "number" ? activeTab.windowId : undefined;
+  const capture = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
   return postJson("/vision/analyze", {
     image: capture,
     symbol: sanitizeSymbol(payload?.symbol || "")

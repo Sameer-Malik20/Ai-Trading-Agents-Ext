@@ -5,6 +5,7 @@
   "description": "AI Trading Agent for NSE/BSE with transparent multi-agent analysis.",
   "permissions": ["activeTab", "storage", "sidePanel", "tabs"],
   "host_permissions": [
+    "<all_urls>",
     "*://*.tradingview.com/*",
     "*://*.zerodha.com/*",
     "*://*.upstox.com/*",

@@ -62,6 +62,30 @@ h2 {
   margin-top: 6px;
 }
 
+.live-monitor-row {
+  margin-top: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.live-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #5e6f84;
+  border: 1px solid #3e4e63;
+}
+
+.live-dot.active {
+  background: var(--green);
+  border-color: #0ea88c;
+  box-shadow: 0 0 0 0 rgba(0, 212, 170, 0.8);
+  animation: pulse-dot 1.2s infinite;
+}
+
 #live-price {
   font-size: 21px;
   font-weight: 700;
@@ -341,6 +365,12 @@ details summary {
   margin-bottom: 8px;
 }
 
+.export-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .icon-btn {
   display: inline-flex;
   align-items: center;
@@ -353,6 +383,12 @@ details summary {
   font-size: 11px;
   font-weight: 700;
   cursor: pointer;
+}
+
+.icon-btn.pdf-btn {
+  background: #1e1a30;
+  color: #ded3ff;
+  border-color: #3a3550;
 }
 
 .icon-btn .icon {
@@ -410,5 +446,17 @@ details summary {
   }
   100% {
     background-position: -200% 0;
+  }
+}
+
+@keyframes pulse-dot {
+  0% {
+    box-shadow: 0 0 0 0 rgba(0, 212, 170, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(0, 212, 170, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(0, 212, 170, 0);
   }
 }

@@ -1,6 +1,8 @@
 const ui = {
   symbolText: document.getElementById("symbol-text"),
   marketStatus: document.getElementById("market-status"),
+  liveMonitorDot: document.getElementById("live-monitor-dot"),
+  liveMonitorText: document.getElementById("live-monitor-text"),
   livePrice: document.getElementById("live-price"),
   sessionWarning: document.getElementById("session-warning"),
   signalBanner: document.getElementById("signal-banner"),
@@ -30,17 +32,29 @@ const ui = {
   quickScanBtn: document.getElementById("quick-scan-btn"),
   screenshotBtn: document.getElementById("screenshot-btn"),
   downloadCsvBtn: document.getElementById("download-csv-btn"),
+  downloadPdfBtn: document.getElementById("download-pdf-btn"),
   scanOutput: document.getElementById("scan-output"),
   loadingSkeleton: document.getElementById("loading-skeleton")
 };
 
 const CIRCLE_CIRCUMFERENCE = 327;
+const TECHNICAL_REFRESH_MS = 2 * 60 * 1000;
+const NEWS_REFRESH_MS = 15 * 60 * 1000;
+const PRICE_MOVE_TRIGGER_PCT = 0.35;
+const PRICE_MOVE_TRIGGER_COOLDOWN_MS = 90 * 1000;
 let activeSymbol = "";
 let ws = null;
 let lastAnalysis = null;
 let lastVision = null;
 let lastQuickScan = null;
 let lastSignalSnapshot = null;
+let analysisInFlight = false;
+let technicalTimer = null;
+let newsTimer = null;
+let monitoringActive = false;
+let lastNewsRefreshAt = 0;
+let lastAutoTriggerAt = 0;
+let referenceTriggerPrice = 0;
 const signalChangeLog = [];
 const liveTickLog = [];
 const eventLog = [];
@@ -53,10 +67,13 @@ async function bootstrap() {
   await hydrateActiveSymbol();
   pushEvent("panel_bootstrap", { symbol: activeSymbol || "" });
   renderSignalHistory();
+  setLiveMonitoringState(false, "Live Monitoring: Idle");
   if (activeSymbol) {
     ui.symbolText.textContent = activeSymbol;
     connectLiveSocket(activeSymbol);
+    runAnalysis({ trigger: "auto_bootstrap", forceNewsRefresh: true, showLoader: false });
   }
+  window.addEventListener("beforeunload", stopLiveMonitoring);
 }
 
 function wireEvents() {
@@ -70,6 +87,13 @@ function wireEvents() {
           ui.scanOutput.textContent = "CSV export handler not available. Reload extension once.";
         };
   ui.downloadCsvBtn?.addEventListener("click", downloadHandler);
+  const downloadPdfHandler =
+    typeof onDownloadPdf === "function"
+      ? onDownloadPdf
+      : () => {
+          ui.scanOutput.textContent = "PDF export handler not available. Reload extension once.";
+        };
+  ui.downloadPdfBtn?.addEventListener("click", downloadPdfHandler);
 }
 
 async function hydrateActiveSymbol() {
@@ -82,34 +106,7 @@ async function hydrateActiveSymbol() {
 }
 
 async function onAnalyze() {
-  showLoading(true);
-  try {
-    await hydrateActiveSymbol();
-    if (!activeSymbol) {
-      throw new Error("Symbol not detected. Open TradingView chart with NSE/BSE symbol.");
-    }
-    pushEvent("analyze_request", { symbol: activeSymbol, capital: 100000 });
-    const response = await safeRuntimeMessage({
-      type: "ANALYZE_SYMBOL",
-      payload: { symbol: activeSymbol, capital: 100000 }
-    });
-    if (!response?.ok || !response?.result) {
-      throw new Error(response?.error || "Analyze failed");
-    }
-    lastAnalysis = response.result;
-    pushEvent("analyze_response", {
-      symbol: lastAnalysis?.symbol || activeSymbol,
-      signal: lastAnalysis?.signal || "",
-      conviction: Number(lastAnalysis?.conviction || 0),
-      degraded: Boolean(lastAnalysis?.degraded)
-    });
-    renderAnalysis(lastAnalysis);
-    connectLiveSocket(activeSymbol);
-  } catch (error) {
-    renderError(String(error?.message || error));
-  } finally {
-    showLoading(false);
-  }
+  await runAnalysis({ trigger: "manual", forceNewsRefresh: true, showLoader: true });
 }
 
 async function onQuickScan() {
@@ -162,14 +159,114 @@ async function onScreenshot() {
       throw new Error(response?.error || "Screenshot analysis failed");
     }
     lastVision = response.result;
+    const patternCount = Array.isArray(lastVision?.patterns) ? lastVision.patterns.length : 0;
     pushEvent("screenshot_response", {
       symbol: lastVision?.symbol || symbol,
       patterns: Array.isArray(lastVision?.patterns) ? lastVision.patterns : []
     });
     appendVisionPatterns(lastVision?.patterns || []);
+    ui.scanOutput.textContent = `Screenshot captured successfully (${patternCount} pattern${patternCount === 1 ? "" : "s"} detected).`;
   } catch (error) {
     pushError("screenshot_error", String(error?.message || error));
     ui.scanOutput.textContent = `Screenshot error: ${String(error?.message || error)}`;
+  }
+}
+
+async function runAnalysis({ trigger = "manual", forceNewsRefresh = false, showLoader = false } = {}) {
+  if (analysisInFlight) return;
+  analysisInFlight = true;
+  if (showLoader) showLoading(true);
+  try {
+    await hydrateActiveSymbol();
+    if (!activeSymbol) {
+      throw new Error("Symbol not detected. Open TradingView chart with NSE/BSE symbol.");
+    }
+    pushEvent("analyze_request", { symbol: activeSymbol, capital: 100000, trigger });
+    const response = await safeRuntimeMessage({
+      type: "ANALYZE_SYMBOL",
+      payload: { symbol: activeSymbol, capital: 100000 }
+    });
+    if (!response?.ok || !response?.result) {
+      throw new Error(response?.error || "Analyze failed");
+    }
+
+    const now = Date.now();
+    const result = response.result;
+    const shouldRefreshNews = forceNewsRefresh || !lastNewsRefreshAt || now - lastNewsRefreshAt >= NEWS_REFRESH_MS;
+    if (!shouldRefreshNews && lastAnalysis?.news_feed) {
+      result.news_feed = lastAnalysis.news_feed;
+      result.sentiment_groq_analysis = lastAnalysis.sentiment_groq_analysis || result.sentiment_groq_analysis;
+      result.sentiment_score = lastAnalysis.sentiment_score ?? result.sentiment_score;
+    } else {
+      lastNewsRefreshAt = now;
+    }
+
+    lastAnalysis = result;
+    referenceTriggerPrice = Number(lastAnalysis?.current_price || referenceTriggerPrice || 0);
+    pushEvent("analyze_response", {
+      symbol: lastAnalysis?.symbol || activeSymbol,
+      signal: lastAnalysis?.signal || "",
+      conviction: Number(lastAnalysis?.conviction || 0),
+      degraded: Boolean(lastAnalysis?.degraded),
+      trigger
+    });
+    renderAnalysis(lastAnalysis);
+    connectLiveSocket(activeSymbol);
+    startLiveMonitoring();
+    if (trigger !== "manual") {
+      ui.scanOutput.textContent = `Live update: ${humanizeTrigger(trigger)} @ ${formatLocalTime(nowIso())}`;
+    }
+  } catch (error) {
+    renderError(String(error?.message || error));
+  } finally {
+    if (showLoader) showLoading(false);
+    analysisInFlight = false;
+  }
+}
+
+function humanizeTrigger(trigger) {
+  const t = String(trigger || "").toUpperCase();
+  if (t === "AUTO_TECHNICAL") return "Technicals refreshed";
+  if (t === "AUTO_NEWS") return "News refreshed";
+  if (t === "PRICE_MOVE") return "Price-move reanalysis";
+  return "Auto refresh";
+}
+
+function startLiveMonitoring() {
+  if (!activeSymbol) return;
+  if (technicalTimer) clearInterval(technicalTimer);
+  if (newsTimer) clearInterval(newsTimer);
+
+  technicalTimer = setInterval(() => {
+    runAnalysis({ trigger: "auto_technical", forceNewsRefresh: false, showLoader: false });
+  }, TECHNICAL_REFRESH_MS);
+
+  newsTimer = setInterval(() => {
+    runAnalysis({ trigger: "auto_news", forceNewsRefresh: true, showLoader: false });
+  }, NEWS_REFRESH_MS);
+
+  monitoringActive = true;
+  setLiveMonitoringState(true, "Live Monitoring: Active");
+  pushEvent("monitoring_started", {
+    symbol: activeSymbol,
+    technical_refresh_ms: TECHNICAL_REFRESH_MS,
+    news_refresh_ms: NEWS_REFRESH_MS
+  });
+}
+
+function stopLiveMonitoring() {
+  if (technicalTimer) clearInterval(technicalTimer);
+  if (newsTimer) clearInterval(newsTimer);
+  technicalTimer = null;
+  newsTimer = null;
+  monitoringActive = false;
+  setLiveMonitoringState(false, "Live Monitoring: Idle");
+}
+
+function setLiveMonitoringState(active, text) {
+  ui.liveMonitorDot?.classList.toggle("active", Boolean(active));
+  if (ui.liveMonitorText) {
+    ui.liveMonitorText.textContent = text || (active ? "Live Monitoring: Active" : "Live Monitoring: Idle");
   }
 }
 
@@ -499,6 +596,225 @@ async function onDownloadCsv() {
   }
 }
 
+async function onDownloadPdf() {
+  try {
+    const backendSnapshot = await fetchBackendTransparency();
+    const rows = buildTransparencyRows(backendSnapshot);
+    const symbol = sanitizeSymbol(activeSymbol || lastAnalysis?.symbol || "MARKET");
+    const stamp = fileTimestamp();
+    const filename = `aegis_report_${symbol}_${stamp}.pdf`;
+    const html = buildStyledPdfReportHtml({
+      filename,
+      symbol,
+      exportedAt: nowIso(),
+      analysis: lastAnalysis || {},
+      quickScan: lastQuickScan || {},
+      vision: lastVision || {},
+      rows,
+      backendSnapshot
+    });
+    openPrintableReport(html, filename);
+    ui.scanOutput.textContent = `PDF report opened: ${filename}. Print / Save as PDF use karein.`;
+    pushEvent("pdf_export", { filename, rows: rows.length });
+  } catch (error) {
+    pushError("pdf_export_error", String(error?.message || error));
+    ui.scanOutput.textContent = `PDF export error: ${String(error?.message || error)}`;
+  }
+}
+
+function openPrintableReport(html, filename) {
+  const win = window.open("", "_blank");
+  if (!win) {
+    throw new Error("Popup blocked. Please allow popups for this extension.");
+  }
+  win.document.open();
+  win.document.write(html);
+  win.document.close();
+  const bindControls = () => {
+    try {
+      if (win.closed) return true;
+      const doc = win.document;
+      if (!doc || !doc.body) return false;
+      doc.title = filename;
+
+      const printBtn = doc.getElementById("report-print-btn");
+      const closeBtn = doc.getElementById("report-close-btn");
+      const toggleBtn = doc.getElementById("appendix-toggle-btn");
+      const appendixDetails = doc.getElementById("appendix-details");
+
+      if (printBtn && !printBtn.dataset.bound) {
+        printBtn.dataset.bound = "1";
+        printBtn.addEventListener("click", () => win.print());
+      }
+
+      if (closeBtn && !closeBtn.dataset.bound) {
+        closeBtn.dataset.bound = "1";
+        closeBtn.addEventListener("click", () => win.close());
+      }
+
+      if (toggleBtn && appendixDetails && !toggleBtn.dataset.bound) {
+        toggleBtn.dataset.bound = "1";
+        toggleBtn.addEventListener("click", () => {
+          const isOpen = Boolean(appendixDetails.open);
+          appendixDetails.open = !isOpen;
+          toggleBtn.textContent = !isOpen
+            ? "^ Hide Full Transparency Appendix"
+            : "< Show Full Transparency Appendix";
+        });
+      }
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  };
+
+  const tryBind = (attempt = 0) => {
+    if (bindControls()) return;
+    if (attempt < 60 && !win.closed) {
+      setTimeout(() => tryBind(attempt + 1), 100);
+    }
+  };
+
+  tryBind();
+}
+
+function buildStyledPdfReportHtml(context) {
+  const analysis = context?.analysis || {};
+  const trade = analysis?.trade_levels || {};
+  const position = analysis?.position_size || {};
+  const conflict = analysis?.signal_conflict || {};
+  const patterns = Array.isArray(analysis?.detected_patterns) ? analysis.detected_patterns : [];
+  const reasons = Array.isArray(analysis?.no_trade_reasons) ? analysis.no_trade_reasons : [];
+  const news = Array.isArray(analysis?.news_feed) ? analysis.news_feed : [];
+  const rows = Array.isArray(context?.rows) ? context.rows : [];
+
+  const patternRows = patterns.length
+    ? patterns
+        .map((p, idx) => `<tr><td>${idx + 1}</td><td>${escapeHtml(p?.name || "--")}</td><td>${escapeHtml(p?.direction || "--")}</td><td>${escapeHtml(p?.confidence || "--")}</td><td>${escapeHtml(p?.reason || p?.trade_implication || "--")}</td></tr>`)
+        .join("")
+    : `<tr><td colspan="5">No pattern data available.</td></tr>`;
+
+  const reasonRows = reasons.length
+    ? reasons.map((r, idx) => `<li>${idx + 1}. ${escapeHtml(r)}</li>`).join("")
+    : "<li>No hard blocker recorded.</li>";
+
+  const newsRows = news.length
+    ? news.slice(0, 12).map((n, idx) => `<tr><td>${idx + 1}</td><td>${escapeHtml(n?.title || "--")}</td><td>${escapeHtml(n?.source || "NA")}</td></tr>`).join("")
+    : `<tr><td colspan="3">No recent news snapshot.</td></tr>`;
+
+  const appendixRows = rows.length
+    ? rows
+        .map((row, idx) => {
+          return `<tr>
+            <td>${idx + 1}</td>
+            <td>${escapeHtml(row?.section || "")}</td>
+            <td>${escapeHtml(row?.timestamp || "")}</td>
+            <td>${escapeHtml(row?.symbol || "")}</td>
+            <td>${escapeHtml(row?.key || "")}</td>
+            <td>${escapeHtml(row?.value || "")}</td>
+            <td>${escapeHtml(row?.json || "")}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="7">No transparency rows available.</td></tr>`;
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${escapeHtml(context?.filename || "Aegis Report")}</title>
+    <style>
+      body { font-family: Inter, Arial, sans-serif; margin: 16px; background: #f5f7fb; color: #1a2a3d; }
+      .toolbar { margin-bottom: 10px; display:flex; gap:8px; }
+      .toolbar button { border:1px solid #cfd8e6; background:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600; }
+      .page { background:#fff; border:1px solid #d9e1ec; border-radius:12px; padding:16px; }
+      h1 { margin: 0 0 4px; font-size: 20px; }
+      h2 { margin: 14px 0 8px; font-size: 15px; color:#122b46; }
+      .meta { font-size: 12px; color: #50657e; }
+      .grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+      .box { border:1px solid #dde6f1; border-radius:8px; padding:8px; background:#f8fbff; }
+      .box .k { font-size:10px; color:#5a718b; text-transform:uppercase; }
+      .box .v { font-size:14px; font-weight:700; margin-top:4px; }
+      table { width:100%; border-collapse:collapse; font-size:12px; }
+      th, td { border:1px solid #dde6f1; padding:6px; text-align:left; vertical-align:top; word-break:break-word; }
+      th { background:#f1f6fc; }
+      .appendix-toggle { border:1px solid #d0dae8; background:#f7faff; color:#153254; border-radius:8px; padding:7px 10px; font-size:12px; font-weight:700; cursor:pointer; }
+      details.appendix-wrap > summary { list-style: none; }
+      details.appendix-wrap > summary::-webkit-details-marker { display:none; }
+      @media print {
+        .toolbar { display:none; }
+        body { margin:0; background:#fff; }
+        .page { border:none; border-radius:0; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="toolbar">
+      <button id="report-print-btn" type="button">Print / Save as PDF</button>
+      <button id="report-close-btn" type="button">Close</button>
+    </div>
+    <div class="page">
+      <h1>Aegis Trading Summary Report</h1>
+      <div class="meta">Symbol: ${escapeHtml(context?.symbol || "UNKNOWN")} | Exported: ${escapeHtml(formatLocalTime(context?.exportedAt || nowIso()))}</div>
+
+      <h2>1) Decision Snapshot</h2>
+      <div class="grid">
+        <div class="box"><div class="k">Signal</div><div class="v">${escapeHtml(String(analysis?.signal || "AVOID"))}</div></div>
+        <div class="box"><div class="k">Conviction</div><div class="v">${num(analysis?.conviction || 0, 1)}%</div></div>
+        <div class="box"><div class="k">Direction</div><div class="v">${escapeHtml(String(analysis?.direction || "NEUTRAL"))}</div></div>
+        <div class="box"><div class="k">Setup Quality</div><div class="v">${escapeHtml(String(analysis?.setup_quality || "D_GRADE"))}</div></div>
+        <div class="box"><div class="k">Recommendation</div><div class="v">${escapeHtml(String(analysis?.trade_recommendation || "No recommendation"))}</div></div>
+        <div class="box"><div class="k">Conflict</div><div class="v">${conflict?.has_conflict ? "YES" : "NO"} (${escapeHtml(String(conflict?.reason || "NA"))})</div></div>
+      </div>
+
+      <h2>2) Trade Plan</h2>
+      <div class="grid">
+        <div class="box"><div class="k">Entry</div><div class="v">${num(trade?.entry || 0, 2)}</div></div>
+        <div class="box"><div class="k">SL</div><div class="v">${num(trade?.sl || 0, 2)}</div></div>
+        <div class="box"><div class="k">T1/T2/T3</div><div class="v">${num(trade?.t1 || 0, 2)} / ${num(trade?.t2 || 0, 2)} / ${num(trade?.t3 || 0, 2)}</div></div>
+        <div class="box"><div class="k">RRR</div><div class="v">${num(trade?.risk_reward_ratio || 0, 2)}</div></div>
+        <div class="box"><div class="k">Qty</div><div class="v">${num(position?.quantity || 0, 0)}</div></div>
+        <div class="box"><div class="k">Risk Budget</div><div class="v">${num(position?.risk_budget || 0, 2)}</div></div>
+      </div>
+
+      <h2>3) No-Trade Reasons</h2>
+      <ul>${reasonRows}</ul>
+
+      <h2>4) Detected Patterns</h2>
+      <table>
+        <thead><tr><th>#</th><th>Pattern</th><th>Direction</th><th>Confidence</th><th>Reason</th></tr></thead>
+        <tbody>${patternRows}</tbody>
+      </table>
+
+      <h2>5) News Snapshot</h2>
+      <table>
+        <thead><tr><th>#</th><th>Headline</th><th>Source</th></tr></thead>
+        <tbody>${newsRows}</tbody>
+      </table>
+
+      <h2>6) Full Transparency Appendix (Complete Data)</h2>
+      <button id="appendix-toggle-btn" class="appendix-toggle" type="button">&lt; Show Full Transparency Appendix</button>
+      <details id="appendix-details" class="appendix-wrap">
+        <summary style="display:none;"></summary>
+        <table>
+          <thead><tr><th>#</th><th>Section</th><th>Timestamp</th><th>Symbol</th><th>Key</th><th>Value</th><th>JSON</th></tr></thead>
+          <tbody>${appendixRows}</tbody>
+        </table>
+      </details>
+    </div>
+  </body>
+</html>`;
+}
+
+function escapeHtml(input) {
+  return String(input ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 async function fetchBackendTransparency() {
   try {
     const base = await getApiBase();
@@ -703,6 +1019,7 @@ function connectLiveSocket(symbol) {
       if (!data?.ok) return;
       const price = Number(data?.price?.last_price || 0);
       if (price > 0) ui.livePrice.textContent = num(price, 2);
+      evaluatePriceMoveTrigger(price, data?.symbol || symbol);
       pushLiveTick({
         symbol: data?.symbol || symbol,
         price,
@@ -716,8 +1033,38 @@ function connectLiveSocket(symbol) {
     };
     ws.onerror = () => {
       pushError("ws_error", `Live socket error for ${symbol}`);
+      setLiveMonitoringState(false, "Live Monitoring: Socket reconnecting...");
+    };
+    ws.onopen = () => {
+      if (monitoringActive) {
+        setLiveMonitoringState(true, "Live Monitoring: Active");
+      }
     };
   } catch (_error) {}
+}
+
+function evaluatePriceMoveTrigger(price, symbol) {
+  if (!monitoringActive || analysisInFlight) return;
+  const p = Number(price || 0);
+  if (p <= 0) return;
+  if (!referenceTriggerPrice || referenceTriggerPrice <= 0) {
+    referenceTriggerPrice = p;
+    return;
+  }
+  const movePct = Math.abs(((p - referenceTriggerPrice) / referenceTriggerPrice) * 100);
+  const now = Date.now();
+  if (movePct < PRICE_MOVE_TRIGGER_PCT) return;
+  if (now - lastAutoTriggerAt < PRICE_MOVE_TRIGGER_COOLDOWN_MS) return;
+
+  lastAutoTriggerAt = now;
+  referenceTriggerPrice = p;
+  pushEvent("price_move_trigger", {
+    symbol: sanitizeSymbol(symbol || activeSymbol),
+    price: p,
+    trigger_pct: Number(movePct.toFixed(3)),
+    threshold_pct: PRICE_MOVE_TRIGGER_PCT
+  });
+  runAnalysis({ trigger: "price_move", forceNewsRefresh: false, showLoader: false });
 }
 
 function marketClass(status) {

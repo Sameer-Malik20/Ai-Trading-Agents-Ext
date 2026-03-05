@@ -13,6 +13,10 @@
           <h1 id="symbol-text">--</h1>
           <span id="market-status" class="pill neutral">UNKNOWN</span>
         </div>
+        <div class="live-monitor-row">
+          <span id="live-monitor-dot" class="live-dot"></span>
+          <span id="live-monitor-text">Live Monitoring: Idle</span>
+        </div>
         <div class="price-row">
           <span id="live-price">0.00</span>
           <span id="session-warning">Waiting for session status...</span>
@@ -103,10 +107,16 @@
       <section class="card actions">
         <div class="actions-head">
           <h2>Actions</h2>
-          <button id="download-csv-btn" class="icon-btn" title="Download complete transparency CSV" aria-label="Download complete transparency CSV">
-            <span class="icon">⬇</span>
-            <span>CSV</span>
-          </button>
+          <div class="export-group">
+            <button id="download-csv-btn" class="icon-btn" title="Download complete transparency CSV" aria-label="Download complete transparency CSV">
+              <span class="icon">DL</span>
+              <span>CSV</span>
+            </button>
+            <button id="download-pdf-btn" class="icon-btn pdf-btn" title="Open styled report and save as PDF" aria-label="Open styled report and save as PDF">
+              <span class="icon">DL</span>
+              <span>PDF</span>
+            </button>
+          </div>
         </div>
         <div class="button-row">
           <button id="analyze-btn" class="btn primary">Analyze</button>
