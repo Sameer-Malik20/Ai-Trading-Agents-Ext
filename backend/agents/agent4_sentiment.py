@@ -16,6 +16,8 @@ import httpx
 import requests
 from zoneinfo import ZoneInfo
 
+from utils.data_fetcher import current_market_session
+
 try:
     from transformers import pipeline  # type: ignore
 except Exception:  # pragma: no cover - runtime fallback
@@ -107,23 +109,40 @@ async def run(symbol: str, provided_headlines: Optional[List[str]] = None, light
             extension_items = [{"title": h, "description": "", "published": "", "source": "Extension"} for h in provided_headlines]
             news_items = _merge_news_sources(symbol, [extension_items, news_items], limit=5)
 
-        finbert_results = await analyze_finbert(news_items, lightweight=lightweight)
+        recency = _apply_news_recency_policy(news_items)
+        scoring_news = recency["items_for_scoring"]
+        display_news = recency["items_for_display"]
+        sentiment_flags = list(recency["flags"])
+        news_freshness = str(recency["news_freshness"])
+        sentiment_confidence = float(recency["sentiment_confidence"])
+
+        finbert_results = await analyze_finbert(scoring_news, lightweight=lightweight)
         finbert_score = _score_from_finbert(finbert_results)
 
-        groq_analysis = await refine_with_groq(symbol, news_items, finbert_score)
+        groq_analysis = await refine_with_groq(
+            symbol,
+            scoring_news if scoring_news else display_news,
+            finbert_score,
+            news_freshness=news_freshness,
+        )
         social = await social_sentiment(symbol) if not lightweight else {"score": 50.0, "source": "skipped"}
 
         sentiment_score = _aggregate_sentiment(finbert_score, groq_analysis, social)
+        if news_freshness == "STALE":
+            sentiment_score = min(sentiment_score, 50.0)
         overall = _band(sentiment_score)
 
         return {
             "ok": True,
             "sentiment_score": round(float(sentiment_score), 2),
-            "news_items": news_items,
+            "news_items": display_news,
             "finbert_results": finbert_results,
             "groq_analysis": groq_analysis,
             "social_score": round(float(social.get("score", 50.0)), 2),
             "overall_sentiment": overall,
+            "news_freshness": news_freshness,
+            "sentiment_confidence": round(sentiment_confidence, 2),
+            "sentiment_flags": sentiment_flags,
             "source": _build_source(finbert_results, groq_analysis),
             "agent_status": "GREEN" if sentiment_score >= 35 else "RED",
             "error": "",
@@ -137,6 +156,9 @@ async def run(symbol: str, provided_headlines: Optional[List[str]] = None, light
             "groq_analysis": {},
             "social_score": 50.0,
             "overall_sentiment": "NEUTRAL",
+            "news_freshness": "STALE",
+            "sentiment_confidence": 20.0,
+            "sentiment_flags": ["STALE_NEWS_WARNING"],
             "source": "fallback",
             "agent_status": "AMBER",
             "error": f"agent4_failure: {exc}",
@@ -338,7 +360,7 @@ def _score_from_finbert(rows: List[Dict[str, Any]]) -> float:
     return max(0.0, min(100.0, total / len(rows)))
 
 
-async def refine_with_groq(symbol: str, news_items: List[Dict[str, str]], finbert_score: float) -> Dict[str, Any]:
+async def refine_with_groq(symbol: str, news_items: List[Dict[str, str]], finbert_score: float, news_freshness: str = "MIXED") -> Dict[str, Any]:
     """Ask Groq to refine financial sentiment."""
 
     if not news_items:
@@ -348,9 +370,12 @@ async def refine_with_groq(symbol: str, news_items: List[Dict[str, str]], finber
         "You are a financial sentiment analyst for Indian stock markets. "
         "Return only JSON."
     )
+    stale_note = "Note: news may be stale, be conservative.\n" if str(news_freshness).upper() == "STALE" else ""
     user_prompt = (
         f"Symbol: {symbol}\n"
         f"Baseline sentiment score: {finbert_score:.2f}\n"
+        f"News freshness state: {news_freshness}\n"
+        f"{stale_note}"
         "Analyze these headlines and return JSON with keys:\n"
         "sentiment_score (0-100, 50=neutral), "
         "key_positive_factors (array), key_negative_factors (array), "
@@ -401,6 +426,69 @@ def _aggregate_sentiment(finbert_score: float, groq_analysis: Dict[str, Any], so
     groq_score = float(groq_analysis.get("sentiment_score", finbert_score if groq_analysis else 50.0))
     social_score = float(social.get("score", 50.0))
     return max(0.0, min(100.0, finbert_score * 0.35 + groq_score * 0.55 + social_score * 0.10))
+
+
+def _apply_news_recency_policy(news_items: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Apply recency policy and attach age metadata to each news item."""
+
+    now = dt.datetime.now(IST)
+    session = current_market_session(now)
+    market_hours = session.status in {"MARKET_OPEN", "OPENING_VOLATILITY"}
+    max_age_hours = 6.0 if market_hours else 24.0
+    annotated = _annotate_news_age(_sort_news_by_recency(news_items), now)
+
+    fresh = [item for item in annotated if item.get("news_age_hours") is None or float(item.get("news_age_hours", 0.0)) <= max_age_hours]
+    stale = [item for item in annotated if item.get("news_age_hours") is not None and float(item.get("news_age_hours", 0.0)) > max_age_hours]
+
+    flags: List[str] = []
+    sentiment_confidence = 100.0
+    if annotated and not fresh:
+        flags.append("STALE_NEWS_WARNING")
+        sentiment_confidence -= 30.0
+        news_freshness = "STALE"
+        return {
+            "items_for_scoring": [],
+            "items_for_display": annotated[:5],
+            "flags": flags,
+            "sentiment_confidence": max(0.0, min(100.0, sentiment_confidence)),
+            "news_freshness": news_freshness,
+        }
+
+    display = fresh[:5] if fresh else annotated[:5]
+    unknown_age = sum(1 for item in display if item.get("news_age_hours") is None)
+    if not display:
+        flags.append("STALE_NEWS_WARNING")
+        sentiment_confidence -= 30.0
+        news_freshness = "STALE"
+    elif stale and fresh:
+        news_freshness = "MIXED"
+    elif unknown_age > 0:
+        news_freshness = "MIXED"
+    else:
+        news_freshness = "FRESH"
+
+    return {
+        "items_for_scoring": fresh[:5],
+        "items_for_display": display,
+        "flags": flags,
+        "sentiment_confidence": max(0.0, min(100.0, sentiment_confidence)),
+        "news_freshness": news_freshness,
+    }
+
+
+def _annotate_news_age(news_items: List[Dict[str, str]], now: dt.datetime) -> List[Dict[str, str]]:
+    """Attach `news_age_hours` metadata to every item."""
+
+    out: List[Dict[str, str]] = []
+    for item in news_items:
+        row = dict(item)
+        published_dt = _parse_datetime_any(item.get("published"))
+        age_hours: float | None = None
+        if published_dt is not None:
+            age_hours = max(0.0, (now - published_dt).total_seconds() / 3600.0)
+        row["news_age_hours"] = round(age_hours, 2) if age_hours is not None else None
+        out.append(row)
+    return out
 
 
 def _band(score: float) -> str:

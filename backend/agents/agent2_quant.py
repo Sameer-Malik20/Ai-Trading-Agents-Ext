@@ -1,4 +1,4 @@
-"""Agent 2: quantitative indicator engine and MTF confluence scoring."""
+"""Agent 2: quantitative indicator engine, MTF confluence, and professional pattern library."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ from utils.indicators import (
     swing_levels,
     timeframe_confluence_score,
 )
+
+
+CONFIDENCE_WEIGHT = {"HIGH": 10, "MEDIUM": 5, "LOW": 2, "NEUTRAL": 2}
 
 
 def run(data_context: DataContext) -> Dict[str, Any]:
@@ -52,13 +55,14 @@ def run(data_context: DataContext) -> Dict[str, Any]:
         regime = detect_market_regime(m15_latest, atr_avg_20) if not m15_df.empty else "NEUTRAL"
 
         daily_df = indicators_by_tf.get("1d", pd.DataFrame())
-        pivots = {}
+        pivots: Dict[str, float] = {}
         if len(daily_df) >= 2:
             pivots = compute_pivots(daily_df.iloc[-1], daily_df.iloc[-2])
         swings = swing_levels(m15_df if not m15_df.empty else daily_df, lookback=20)
         round_lvls = round_number_levels(float(data_context.current_price))
+
         h1_df = indicators_by_tf.get("1h", pd.DataFrame())
-        patterns = _detect_patterns(m15_df, h1_df)
+        patterns, pattern_summary = _detect_patterns(m15_df, h1_df)
 
         adx = _safe_metric(snapshot_by_tf.get("15m", {}).get("adx_14"), default=20.0)
         rsi = _safe_metric(snapshot_by_tf.get("15m", {}).get("rsi_14"), default=50.0)
@@ -76,6 +80,7 @@ def run(data_context: DataContext) -> Dict[str, Any]:
             "confluence_checks": confluence_checks,
             "indicators": _serialize_snapshot(snapshot_by_tf),
             "patterns": patterns,
+            "pattern_summary": pattern_summary,
             "key_levels": {
                 "pivots": pivots,
                 "swings": swings,
@@ -219,7 +224,26 @@ def _degraded_output(reason: str) -> Dict[str, Any]:
         "timeframe_scores": {"5m": 5, "15m": 5, "1h": 5, "1d": 5},
         "confluence_checks": {},
         "indicators": {},
-        "patterns": [{"name": "Quant Degraded", "reason": "Indicator computation failed."}],
+        "patterns": [
+            {
+                "name": "No Strong Pattern",
+                "direction": "NEUTRAL",
+                "confidence": "LOW",
+                "timeframe": "15m",
+                "confirmed_on_1h": False,
+                "reason": "Indicator computation failed.",
+                "trade_implication": "Avoid fresh positions until stable signal appears.",
+            }
+        ],
+        "pattern_summary": {
+            "bullish_patterns": 0,
+            "bearish_patterns": 0,
+            "neutral_patterns": 1,
+            "strong_bullish_confluence": False,
+            "strong_bearish_confluence": False,
+            "pattern_conflict": False,
+            "conviction_adjustment": 0,
+        },
         "key_levels": {"pivots": {}, "swings": {}, "round_levels": {}},
         "atr_current": 0.0,
         "adx_current": 0.0,
@@ -227,94 +251,268 @@ def _degraded_output(reason: str) -> Dict[str, Any]:
     }
 
 
-def _detect_patterns(m15_df: pd.DataFrame, h1_df: pd.DataFrame) -> List[Dict[str, str]]:
-    """Detect candlestick and chart patterns on 15m candles with 1h confirmation."""
+def _detect_patterns(m15_df: pd.DataFrame, h1_df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Detect complete candlestick, chart, and volume pattern library."""
 
-    if m15_df is None or m15_df.empty or len(m15_df) < 20:
-        return [{"name": "No Strong Pattern", "direction": "NEUTRAL", "confidence": "LOW", "reason": "Insufficient 15m candles for pattern scan."}]
+    if m15_df is None or m15_df.empty or len(m15_df) < 30:
+        fallback = [
+            _pattern(
+                name="No Strong Pattern",
+                direction="NEUTRAL",
+                confidence="LOW",
+                confirmed_on_1h=False,
+                reason="Insufficient 15m candles for full pattern scan.",
+                trade_implication="Wait for more structure before entering a trade.",
+            )
+        ]
+        return fallback, _pattern_summary(fallback)
 
-    patterns: List[Dict[str, str]] = []
-    c3 = m15_df.tail(3).copy()
-    c20 = m15_df.tail(20).copy()
-    trend_hint = _short_trend_bias(m15_df.tail(10))
-    h1_bias = _timeframe_bias(h1_df)
+    m15 = m15_df.tail(60).copy()
+    h1 = h1_df.tail(60).copy() if h1_df is not None else pd.DataFrame()
+    h1_bias = _timeframe_bias(h1)
 
-    # Candlestick patterns over last 3 candles.
-    if len(c3) >= 2:
-        prev = c3.iloc[-2]
-        curr = c3.iloc[-1]
-        if _is_bullish_engulfing(prev, curr):
-            patterns.append(_build_pattern("Bullish Engulfing", "BULLISH", 2, "Bearish candle followed by full bullish body engulfing previous body.", h1_bias))
-        if _is_bearish_engulfing(prev, curr):
-            patterns.append(_build_pattern("Bearish Engulfing", "BEARISH", 2, "Bullish candle followed by full bearish body engulfing previous body.", h1_bias))
+    patterns: List[Dict[str, Any]] = []
+    c1 = m15.iloc[-1]
+    c2 = m15.iloc[-2]
+    trend20 = _trend_context(m15.tail(20))
 
-    for _, candle in c3.iterrows():
-        if _is_doji(candle):
-            doji_direction = _doji_direction(trend_hint, h1_bias)
-            patterns.append(_build_pattern("Doji", doji_direction, 1, "Open and close are nearly equal (<=0.1%), signaling indecision and reversal risk.", h1_bias))
-        if _is_hammer(candle):
-            patterns.append(_build_pattern("Hammer", "BULLISH", 2, "Lower wick is at least 2x body with small upper wick after local weakness.", h1_bias))
-        if _is_shooting_star(candle):
-            patterns.append(_build_pattern("Shooting Star", "BEARISH", 2, "Upper wick is at least 2x body with small lower wick after local strength.", h1_bias))
+    # 1) Single-candle patterns.
+    if _is_doji(c1):
+        patterns.append(
+            _pattern(
+                "Doji",
+                "NEUTRAL",
+                "LOW",
+                _confirm_direction("NEUTRAL", h1_bias),
+                "Open and close are nearly equal, reflecting indecision.",
+                "Wait for breakout confirmation before committing.",
+            )
+        )
+    if _is_hammer(c1) and trend20 == "DOWN":
+        patterns.append(
+            _pattern(
+                "Hammer",
+                "BULLISH",
+                "MEDIUM",
+                _confirm_direction("BULLISH", h1_bias),
+                "Long lower wick after downtrend shows buyer absorption.",
+                "Bias long only above hammer high.",
+            )
+        )
+    if _is_shooting_star(c1) and trend20 == "UP":
+        patterns.append(
+            _pattern(
+                "Shooting Star",
+                "BEARISH",
+                "MEDIUM",
+                _confirm_direction("BEARISH", h1_bias),
+                "Long upper wick after uptrend shows rejection at highs.",
+                "Bias short only below pattern low.",
+            )
+        )
+    if _is_hammer(c1) and trend20 == "UP":
+        patterns.append(
+            _pattern(
+                "Hanging Man",
+                "BEARISH",
+                "MEDIUM",
+                _confirm_direction("BEARISH", h1_bias),
+                "Hammer-like candle after uptrend warns of distribution.",
+                "Avoid fresh longs until confirmation.",
+            )
+        )
+    if _is_shooting_star(c1) and trend20 == "DOWN":
+        patterns.append(
+            _pattern(
+                "Inverted Hammer",
+                "BULLISH",
+                "MEDIUM",
+                _confirm_direction("BULLISH", h1_bias),
+                "Shooting-star shape after downtrend suggests possible reversal.",
+                "Consider long on follow-through candle.",
+            )
+        )
+    if _is_bullish_marubozu(c1):
+        patterns.append(
+            _pattern(
+                "Bullish Marubozu",
+                "BULLISH",
+                "HIGH",
+                _confirm_direction("BULLISH", h1_bias),
+                "Large bullish body with tiny wicks indicates strong control.",
+                "Momentum continuation favored.",
+            )
+        )
+    if _is_bearish_marubozu(c1):
+        patterns.append(
+            _pattern(
+                "Bearish Marubozu",
+                "BEARISH",
+                "HIGH",
+                _confirm_direction("BEARISH", h1_bias),
+                "Large bearish body with tiny wicks indicates aggressive selling.",
+                "Momentum downside continuation favored.",
+            )
+        )
+    if _is_spinning_top(c1):
+        patterns.append(
+            _pattern(
+                "Spinning Top",
+                "NEUTRAL",
+                "LOW",
+                _confirm_direction("NEUTRAL", h1_bias),
+                "Small body with balanced wicks shows indecision.",
+                "Reduce size until direction resolves.",
+            )
+        )
 
-    if len(c3) == 3:
-        if _is_morning_star(c3):
-            patterns.append(_build_pattern("Morning Star", "BULLISH", 3, "Three-candle bullish reversal: strong down candle, indecision, then bullish recovery.", h1_bias))
-        if _is_evening_star(c3):
-            patterns.append(_build_pattern("Evening Star", "BEARISH", 3, "Three-candle bearish reversal: strong up candle, indecision, then bearish rejection.", h1_bias))
+    # 2) Two-candle patterns.
+    if _is_bullish_engulfing(c2, c1):
+        patterns.append(_pattern("Bullish Engulfing", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Bearish body is fully engulfed by strong bullish candle.", "Long bias with tight stop below pattern low."))
+    if _is_bearish_engulfing(c2, c1):
+        patterns.append(_pattern("Bearish Engulfing", "BEARISH", "HIGH", _confirm_direction("BEARISH", h1_bias), "Bullish body is fully engulfed by strong bearish candle.", "Short bias with stop above pattern high."))
+    if _is_tweezer_bottom(c2, c1):
+        patterns.append(_pattern("Tweezer Bottom", "BULLISH", "MEDIUM", _confirm_direction("BULLISH", h1_bias), "Two candles reject the same low zone.", "Potential reversal if neckline breaks."))
+    if _is_tweezer_top(c2, c1):
+        patterns.append(_pattern("Tweezer Top", "BEARISH", "MEDIUM", _confirm_direction("BEARISH", h1_bias), "Two candles reject the same high zone.", "Potential reversal if support breaks."))
+    if _is_piercing_line(c2, c1):
+        patterns.append(_pattern("Piercing Line", "BULLISH", "MEDIUM", _confirm_direction("BULLISH", h1_bias), "Bull candle closes above midpoint of prior bear body.", "Early bullish reversal signal."))
+    if _is_dark_cloud_cover(c2, c1):
+        patterns.append(_pattern("Dark Cloud Cover", "BEARISH", "MEDIUM", _confirm_direction("BEARISH", h1_bias), "Bear candle closes below midpoint of prior bull body.", "Early bearish reversal signal."))
 
-    # Chart patterns over last 20 candles.
+    # 3) Three-candle patterns.
+    last3 = m15.tail(3)
+    if _is_morning_star(last3):
+        patterns.append(_pattern("Morning Star", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Three-candle bullish reversal with strong recovery candle.", "Long setup on confirmation break."))
+    if _is_evening_star(last3):
+        patterns.append(_pattern("Evening Star", "BEARISH", "HIGH", _confirm_direction("BEARISH", h1_bias), "Three-candle bearish reversal with strong rejection candle.", "Short setup on confirmation break."))
+    if _is_three_white_soldiers(last3):
+        patterns.append(_pattern("Three White Soldiers", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Three strong consecutive bullish candles indicate sustained demand.", "Momentum long continuation setup."))
+    if _is_three_black_crows(last3):
+        patterns.append(_pattern("Three Black Crows", "BEARISH", "HIGH", _confirm_direction("BEARISH", h1_bias), "Three strong consecutive bearish candles indicate sustained supply.", "Momentum short continuation setup."))
+    if _is_three_inside_up(last3):
+        patterns.append(_pattern("Three Inside Up", "BULLISH", "MEDIUM", _confirm_direction("BULLISH", h1_bias), "Inside candle followed by bullish confirmation breakout.", "Bullish reversal with moderate confidence."))
+    if _is_three_inside_down(last3):
+        patterns.append(_pattern("Three Inside Down", "BEARISH", "MEDIUM", _confirm_direction("BEARISH", h1_bias), "Inside candle followed by bearish confirmation breakdown.", "Bearish reversal with moderate confidence."))
+
+    # 4) Chart patterns (20-50 candles).
+    c20 = m15.tail(20)
+    c50 = m15.tail(50)
     if _is_double_bottom(c20):
-        patterns.append(_build_pattern("Double Bottom", "BULLISH", 3, "Two similar lows formed with neckline breakout on 15m structure.", h1_bias))
+        patterns.append(_pattern("Double Bottom", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Two comparable lows with neckline reclaim.", "Bullish reversal breakout candidate."))
     if _is_double_top(c20):
-        patterns.append(_build_pattern("Double Top", "BEARISH", 3, "Two similar highs formed with neckline breakdown on 15m structure.", h1_bias))
+        patterns.append(_pattern("Double Top", "BEARISH", "HIGH", _confirm_direction("BEARISH", h1_bias), "Two comparable highs with neckline breakdown.", "Bearish reversal breakdown candidate."))
+    if _is_head_shoulders(c50):
+        patterns.append(_pattern("Head and Shoulders", "BEARISH", "HIGH", _confirm_direction("BEARISH", h1_bias), "Higher middle peak with weaker right shoulder.", "Bearish reversal bias; watch neckline."))
+    if _is_inverse_head_shoulders(c50):
+        patterns.append(_pattern("Inverse Head and Shoulders", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Lower middle trough with stronger right shoulder.", "Bullish reversal bias; watch neckline."))
     if _is_bull_flag(c20):
-        patterns.append(_build_pattern("Bull Flag", "BULLISH", 2, "Strong impulse up followed by tight/slight pullback consolidation.", h1_bias))
+        patterns.append(_pattern("Bull Flag", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Strong impulse up followed by shallow consolidation.", "Trend continuation long setup."))
     if _is_bear_flag(c20):
-        patterns.append(_build_pattern("Bear Flag", "BEARISH", 2, "Strong impulse down followed by tight/slight upward consolidation.", h1_bias))
+        patterns.append(_pattern("Bear Flag", "BEARISH", "HIGH", _confirm_direction("BEARISH", h1_bias), "Strong impulse down followed by weak bounce.", "Trend continuation short setup."))
+    if _is_ascending_triangle(c50):
+        patterns.append(_pattern("Ascending Triangle", "BULLISH", "MEDIUM", _confirm_direction("BULLISH", h1_bias), "Flat resistance with rising lows compressing price.", "Bullish breakout probability elevated."))
+    if _is_descending_triangle(c50):
+        patterns.append(_pattern("Descending Triangle", "BEARISH", "MEDIUM", _confirm_direction("BEARISH", h1_bias), "Flat support with falling highs compressing price.", "Bearish breakdown probability elevated."))
+    sym_direction = _is_symmetrical_triangle(c50)
+    if sym_direction:
+        patterns.append(_pattern("Symmetrical Triangle", sym_direction, "MEDIUM", _confirm_direction(sym_direction, h1_bias), "Converging highs/lows with breakout-led directional edge.", "Trade only in breakout direction."))
+    if _is_rising_wedge(c50):
+        patterns.append(_pattern("Rising Wedge", "BEARISH", "MEDIUM", _confirm_direction("BEARISH", h1_bias), "Upward sloping but narrowing structure weakens trend quality.", "Bearish breakdown risk rising."))
+    if _is_falling_wedge(c50):
+        patterns.append(_pattern("Falling Wedge", "BULLISH", "MEDIUM", _confirm_direction("BULLISH", h1_bias), "Downward sloping but narrowing structure indicates selling exhaustion.", "Bullish breakout risk rising."))
+    if _is_cup_handle(c50):
+        patterns.append(_pattern("Cup and Handle", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Rounded base followed by controlled pullback handle.", "Bullish continuation breakout setup."))
     if _is_hh_hl(c20):
-        patterns.append(_build_pattern("Higher Highs Higher Lows", "BULLISH", 2, "Recent swings show sequential higher highs and higher lows.", h1_bias))
+        patterns.append(_pattern("Higher Highs Higher Lows", "BULLISH", "HIGH", _confirm_direction("BULLISH", h1_bias), "Swing structure confirms persistent uptrend.", "Prefer long pullback entries."))
     if _is_lh_ll(c20):
-        patterns.append(_build_pattern("Lower Highs Lower Lows", "BEARISH", 2, "Recent swings show sequential lower highs and lower lows.", h1_bias))
+        patterns.append(_pattern("Lower Highs Lower Lows", "BEARISH", "HIGH", _confirm_direction("BEARISH", h1_bias), "Swing structure confirms persistent downtrend.", "Prefer short bounce entries."))
+
+    # 5) Volume patterns.
+    if _is_volume_climax(m15):
+        patterns.append(_pattern("Volume Climax", "NEUTRAL", "LOW", _confirm_direction("NEUTRAL", h1_bias), "Extreme volume spike suggests possible blow-off/exhaustion move.", "Protect profit and wait for confirmation."))
+    if _is_volume_divergence(m15):
+        patterns.append(_pattern("Volume Divergence", "NEUTRAL", "LOW", _confirm_direction("NEUTRAL", h1_bias), "Price trend and volume trend are diverging.", "Caution: trend may weaken soon."))
+    breakout_dir = _breakout_with_volume(m15)
+    if breakout_dir:
+        patterns.append(_pattern("Breakout with Volume", breakout_dir, "HIGH", _confirm_direction(breakout_dir, h1_bias), "Range breakout occurred with volume expansion.", "Follow breakout direction with risk control."))
 
     deduped = _dedupe_patterns(patterns)
-    if deduped:
-        return deduped
-    return [{"name": "No Strong Pattern", "direction": "NEUTRAL", "confidence": "LOW", "reason": "No high-quality reversal or continuation structure detected on 15m."}]
+    if not deduped:
+        deduped = [
+            _pattern(
+                "No Strong Pattern",
+                "NEUTRAL",
+                "LOW",
+                False,
+                "No meaningful pattern cluster detected on 15m.",
+                "Stand aside until pattern clarity improves.",
+            )
+        ]
+    return deduped, _pattern_summary(deduped)
 
 
-def _build_pattern(name: str, direction: str, base_strength: int, reason: str, h1_bias: str) -> Dict[str, str]:
-    """Build pattern response with 1h confirmation-aware confidence."""
+def _pattern(name: str, direction: str, confidence: str, confirmed_on_1h: bool, reason: str, trade_implication: str) -> Dict[str, Any]:
+    """Create one normalized pattern object."""
 
-    confirmed = direction == h1_bias and direction in {"BULLISH", "BEARISH"}
-    adjusted_strength = base_strength + (1 if confirmed else -1)
-    confidence = "HIGH" if adjusted_strength >= 3 else "MEDIUM" if adjusted_strength == 2 else "LOW"
-    confirm_note = " 1h confirms direction." if confirmed else " 1h confirmation is weak/mixed."
     return {
         "name": name,
         "direction": direction,
         "confidence": confidence,
-        "reason": f"{reason}{confirm_note}",
+        "timeframe": "15m",
+        "confirmed_on_1h": bool(confirmed_on_1h),
+        "reason": reason,
+        "trade_implication": trade_implication,
     }
 
 
-def _dedupe_patterns(patterns: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Deduplicate patterns and keep the highest confidence instance."""
+def _pattern_summary(patterns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build confluence/conflict summary and conviction adjustment."""
 
-    rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
-    best: Dict[Tuple[str, str], Dict[str, str]] = {}
-    order: List[Tuple[str, str]] = []
+    bullish = [p for p in patterns if p.get("direction") == "BULLISH"]
+    bearish = [p for p in patterns if p.get("direction") == "BEARISH"]
+    neutral = [p for p in patterns if p.get("direction") == "NEUTRAL"]
+
+    adjustment = 0
+    for p in bullish:
+        adjustment += CONFIDENCE_WEIGHT.get(str(p.get("confidence", "LOW")).upper(), 2)
+    for p in bearish:
+        adjustment -= CONFIDENCE_WEIGHT.get(str(p.get("confidence", "LOW")).upper(), 2)
+
+    pattern_conflict = len(bullish) > 0 and len(bearish) > 0
+    if pattern_conflict:
+        adjustment -= 10
+
+    return {
+        "bullish_patterns": len(bullish),
+        "bearish_patterns": len(bearish),
+        "neutral_patterns": len(neutral),
+        "strong_bullish_confluence": len(bullish) >= 3,
+        "strong_bearish_confluence": len(bearish) >= 3,
+        "pattern_conflict": pattern_conflict,
+        "conviction_adjustment": int(max(-40, min(40, adjustment))),
+    }
+
+
+def _dedupe_patterns(patterns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate patterns and keep strongest confidence per pattern name."""
+
+    rank = {"LOW": 1, "NEUTRAL": 1, "MEDIUM": 2, "HIGH": 3}
+    best: Dict[str, Dict[str, Any]] = {}
     for item in patterns:
-        key = (item.get("name", ""), item.get("direction", ""))
+        key = str(item.get("name", "")).strip()
+        if not key:
+            continue
         if key not in best:
             best[key] = item
-            order.append(key)
             continue
-        cur = rank.get(item.get("confidence", "LOW"), 1)
-        prev = rank.get(best[key].get("confidence", "LOW"), 1)
+        cur = rank.get(str(item.get("confidence", "LOW")).upper(), 1)
+        prev = rank.get(str(best[key].get("confidence", "LOW")).upper(), 1)
         if cur > prev:
             best[key] = item
-    return [best[k] for k in order]
+    ordered = list(best.values())
+    ordered.sort(key=lambda p: (str(p.get("confidence", "LOW")) != "HIGH", p.get("name", "")))
+    return ordered[:18]
 
 
 def _safe_float(value: Any) -> float:
@@ -327,7 +525,7 @@ def _safe_float(value: Any) -> float:
 
 
 def _candle_parts(candle: pd.Series) -> Tuple[float, float, float, float, float]:
-    """Return body, upper wick, lower wick, range and open-close delta."""
+    """Return body, upper wick, lower wick, range and delta."""
 
     o = _safe_float(candle.get("open"))
     h = _safe_float(candle.get("high"))
@@ -341,182 +539,380 @@ def _candle_parts(candle: pd.Series) -> Tuple[float, float, float, float, float]
     return body, upper, lower, rng, delta
 
 
-def _is_bullish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
-    """Check bullish engulfing on two candles."""
+def _trend_context(window: pd.DataFrame) -> str:
+    """Simple trend context for pattern direction gating."""
 
+    if window is None or window.empty or len(window) < 8:
+        return "SIDE"
+    first = _safe_float(window["close"].iloc[0])
+    last = _safe_float(window["close"].iloc[-1])
+    change = (last - first) / max(first, 1e-9)
+    if change > 0.01:
+        return "UP"
+    if change < -0.01:
+        return "DOWN"
+    return "SIDE"
+
+
+def _confirm_direction(direction: str, h1_bias: str) -> bool:
+    """Confirm pattern direction against 1h bias."""
+
+    if direction == "NEUTRAL":
+        return h1_bias == "NEUTRAL"
+    return direction == h1_bias
+
+
+def _is_doji(candle: pd.Series) -> bool:
+    """Doji threshold at 0.1%."""
+
+    o = _safe_float(candle.get("open"))
+    c = _safe_float(candle.get("close"))
+    return abs(o - c) / max(abs(c), 1e-9) <= 0.001
+
+
+def _is_hammer(candle: pd.Series) -> bool:
+    body, upper, lower, rng, _ = _candle_parts(candle)
+    return lower >= (2.0 * max(body, 1e-9)) and upper <= (0.35 * max(body, 1e-9)) and body / rng <= 0.45
+
+
+def _is_shooting_star(candle: pd.Series) -> bool:
+    body, upper, lower, rng, _ = _candle_parts(candle)
+    return upper >= (2.0 * max(body, 1e-9)) and lower <= (0.35 * max(body, 1e-9)) and body / rng <= 0.45
+
+
+def _is_bullish_marubozu(candle: pd.Series) -> bool:
+    body, upper, lower, rng, delta = _candle_parts(candle)
+    return delta > 0 and body / rng >= 0.85 and upper / rng <= 0.08 and lower / rng <= 0.08
+
+
+def _is_bearish_marubozu(candle: pd.Series) -> bool:
+    body, upper, lower, rng, delta = _candle_parts(candle)
+    return delta < 0 and body / rng >= 0.85 and upper / rng <= 0.08 and lower / rng <= 0.08
+
+
+def _is_spinning_top(candle: pd.Series) -> bool:
+    body, upper, lower, rng, _ = _candle_parts(candle)
+    return body / rng <= 0.3 and upper >= body and lower >= body
+
+
+def _is_bullish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
     po, pc = _safe_float(prev.get("open")), _safe_float(prev.get("close"))
     co, cc = _safe_float(curr.get("open")), _safe_float(curr.get("close"))
     prev_bear = pc < po
     curr_bull = cc > co
-    prev_body = abs(pc - po)
-    curr_body = abs(cc - co)
     engulf = co <= pc and cc >= po
-    return prev_bear and curr_bull and curr_body > prev_body and engulf
+    return prev_bear and curr_bull and engulf and abs(cc - co) > abs(pc - po)
 
 
 def _is_bearish_engulfing(prev: pd.Series, curr: pd.Series) -> bool:
-    """Check bearish engulfing on two candles."""
-
     po, pc = _safe_float(prev.get("open")), _safe_float(prev.get("close"))
     co, cc = _safe_float(curr.get("open")), _safe_float(curr.get("close"))
     prev_bull = pc > po
     curr_bear = cc < co
-    prev_body = abs(pc - po)
-    curr_body = abs(cc - co)
     engulf = co >= pc and cc <= po
-    return prev_bull and curr_bear and curr_body > prev_body and engulf
+    return prev_bull and curr_bear and engulf and abs(cc - co) > abs(pc - po)
 
 
-def _is_doji(candle: pd.Series) -> bool:
-    """Doji: open-close difference within 0.1% of close."""
-
-    o = _safe_float(candle.get("open"))
-    c = _safe_float(candle.get("close"))
-    ref = max(abs(c), 1e-9)
-    return abs(o - c) / ref <= 0.001
+def _is_tweezer_bottom(prev: pd.Series, curr: pd.Series) -> bool:
+    p_low = _safe_float(prev.get("low"))
+    c_low = _safe_float(curr.get("low"))
+    tol = max(p_low, c_low, 1e-9) * 0.0015
+    return abs(p_low - c_low) <= tol and _safe_float(curr.get("close")) > _safe_float(curr.get("open"))
 
 
-def _is_hammer(candle: pd.Series) -> bool:
-    """Hammer: long lower wick, small upper wick, compact body."""
+def _is_tweezer_top(prev: pd.Series, curr: pd.Series) -> bool:
+    p_high = _safe_float(prev.get("high"))
+    c_high = _safe_float(curr.get("high"))
+    tol = max(p_high, c_high, 1e-9) * 0.0015
+    return abs(p_high - c_high) <= tol and _safe_float(curr.get("close")) < _safe_float(curr.get("open"))
 
-    body, upper, lower, rng, _ = _candle_parts(candle)
-    return lower >= (2.0 * max(body, 1e-9)) and upper <= (0.35 * max(body, 1e-9)) and body / rng <= 0.5
+
+def _is_piercing_line(prev: pd.Series, curr: pd.Series) -> bool:
+    po, pc = _safe_float(prev.get("open")), _safe_float(prev.get("close"))
+    co, cc = _safe_float(curr.get("open")), _safe_float(curr.get("close"))
+    midpoint = (po + pc) / 2.0
+    return pc < po and cc > co and cc > midpoint and co < pc
 
 
-def _is_shooting_star(candle: pd.Series) -> bool:
-    """Shooting star: long upper wick, small lower wick, compact body."""
-
-    body, upper, lower, rng, _ = _candle_parts(candle)
-    return upper >= (2.0 * max(body, 1e-9)) and lower <= (0.35 * max(body, 1e-9)) and body / rng <= 0.5
+def _is_dark_cloud_cover(prev: pd.Series, curr: pd.Series) -> bool:
+    po, pc = _safe_float(prev.get("open")), _safe_float(prev.get("close"))
+    co, cc = _safe_float(curr.get("open")), _safe_float(curr.get("close"))
+    midpoint = (po + pc) / 2.0
+    return pc > po and cc < co and cc < midpoint and co > pc
 
 
 def _is_morning_star(c3: pd.DataFrame) -> bool:
-    """Morning star three-candle bullish reversal."""
-
     c1, c2, c3c = c3.iloc[0], c3.iloc[1], c3.iloc[2]
-    o1, c1c = _safe_float(c1.get("open")), _safe_float(c1.get("close"))
-    o2, c2c = _safe_float(c2.get("open")), _safe_float(c2.get("close"))
-    o3, c3v = _safe_float(c3c.get("open")), _safe_float(c3c.get("close"))
-    body1 = abs(c1c - o1)
-    body2 = abs(c2c - o2)
-    midpoint1 = (o1 + c1c) / 2.0
-    return (c1c < o1) and (body2 <= body1 * 0.6) and (c3v > o3) and (c3v > midpoint1)
+    o1, cl1 = _safe_float(c1.get("open")), _safe_float(c1.get("close"))
+    o2, cl2 = _safe_float(c2.get("open")), _safe_float(c2.get("close"))
+    o3, cl3 = _safe_float(c3c.get("open")), _safe_float(c3c.get("close"))
+    body1 = abs(cl1 - o1)
+    body2 = abs(cl2 - o2)
+    midpoint = (o1 + cl1) / 2.0
+    return cl1 < o1 and body2 <= body1 * 0.6 and cl3 > o3 and cl3 > midpoint
 
 
 def _is_evening_star(c3: pd.DataFrame) -> bool:
-    """Evening star three-candle bearish reversal."""
-
     c1, c2, c3c = c3.iloc[0], c3.iloc[1], c3.iloc[2]
-    o1, c1c = _safe_float(c1.get("open")), _safe_float(c1.get("close"))
-    o2, c2c = _safe_float(c2.get("open")), _safe_float(c2.get("close"))
-    o3, c3v = _safe_float(c3c.get("open")), _safe_float(c3c.get("close"))
-    body1 = abs(c1c - o1)
-    body2 = abs(c2c - o2)
-    midpoint1 = (o1 + c1c) / 2.0
-    return (c1c > o1) and (body2 <= body1 * 0.6) and (c3v < o3) and (c3v < midpoint1)
+    o1, cl1 = _safe_float(c1.get("open")), _safe_float(c1.get("close"))
+    o2, cl2 = _safe_float(c2.get("open")), _safe_float(c2.get("close"))
+    o3, cl3 = _safe_float(c3c.get("open")), _safe_float(c3c.get("close"))
+    body1 = abs(cl1 - o1)
+    body2 = abs(cl2 - o2)
+    midpoint = (o1 + cl1) / 2.0
+    return cl1 > o1 and body2 <= body1 * 0.6 and cl3 < o3 and cl3 < midpoint
+
+
+def _is_three_white_soldiers(c3: pd.DataFrame) -> bool:
+    arr = c3[["open", "close"]].to_numpy(dtype=float)
+    return bool(np.all(arr[:, 1] > arr[:, 0]) and np.all(np.diff(arr[:, 1]) > 0))
+
+
+def _is_three_black_crows(c3: pd.DataFrame) -> bool:
+    arr = c3[["open", "close"]].to_numpy(dtype=float)
+    return bool(np.all(arr[:, 1] < arr[:, 0]) and np.all(np.diff(arr[:, 1]) < 0))
+
+
+def _is_three_inside_up(c3: pd.DataFrame) -> bool:
+    first, second, third = c3.iloc[0], c3.iloc[1], c3.iloc[2]
+    f_open, f_close = _safe_float(first["open"]), _safe_float(first["close"])
+    s_open, s_close = _safe_float(second["open"]), _safe_float(second["close"])
+    t_close = _safe_float(third["close"])
+    first_bear = f_close < f_open
+    inside = min(f_open, f_close) <= s_open <= max(f_open, f_close) and min(f_open, f_close) <= s_close <= max(f_open, f_close)
+    return first_bear and inside and t_close > max(f_open, f_close)
+
+
+def _is_three_inside_down(c3: pd.DataFrame) -> bool:
+    first, second, third = c3.iloc[0], c3.iloc[1], c3.iloc[2]
+    f_open, f_close = _safe_float(first["open"]), _safe_float(first["close"])
+    s_open, s_close = _safe_float(second["open"]), _safe_float(second["close"])
+    t_close = _safe_float(third["close"])
+    first_bull = f_close > f_open
+    inside = min(f_open, f_close) <= s_open <= max(f_open, f_close) and min(f_open, f_close) <= s_close <= max(f_open, f_close)
+    return first_bull and inside and t_close < min(f_open, f_close)
 
 
 def _is_double_bottom(c20: pd.DataFrame) -> bool:
-    """Double bottom with neckline breakout."""
-
     lows = c20["low"].reset_index(drop=True)
     highs = c20["high"].reset_index(drop=True)
     closes = c20["close"].reset_index(drop=True)
-    idx = [i for i in range(1, len(lows) - 1) if lows.iloc[i] <= lows.iloc[i - 1] and lows.iloc[i] <= lows.iloc[i + 1]]
-    if len(idx) < 2:
+    piv = [i for i in range(1, len(lows) - 1) if lows.iloc[i] <= lows.iloc[i - 1] and lows.iloc[i] <= lows.iloc[i + 1]]
+    if len(piv) < 2:
         return False
-    i1, i2 = idx[-2], idx[-1]
+    i1, i2 = piv[-2], piv[-1]
     if (i2 - i1) < 3:
         return False
     l1, l2 = lows.iloc[i1], lows.iloc[i2]
-    if abs(l1 - l2) / max(l1, l2, 1e-9) > 0.008:
+    if abs(l1 - l2) / max(l1, l2, 1e-9) > 0.009:
         return False
     neckline = float(highs.iloc[i1 : i2 + 1].max())
     return float(closes.iloc[-1]) > neckline * 1.001
 
 
 def _is_double_top(c20: pd.DataFrame) -> bool:
-    """Double top with neckline breakdown."""
-
     lows = c20["low"].reset_index(drop=True)
     highs = c20["high"].reset_index(drop=True)
     closes = c20["close"].reset_index(drop=True)
-    idx = [i for i in range(1, len(highs) - 1) if highs.iloc[i] >= highs.iloc[i - 1] and highs.iloc[i] >= highs.iloc[i + 1]]
-    if len(idx) < 2:
+    piv = [i for i in range(1, len(highs) - 1) if highs.iloc[i] >= highs.iloc[i - 1] and highs.iloc[i] >= highs.iloc[i + 1]]
+    if len(piv) < 2:
         return False
-    i1, i2 = idx[-2], idx[-1]
+    i1, i2 = piv[-2], piv[-1]
     if (i2 - i1) < 3:
         return False
     h1, h2 = highs.iloc[i1], highs.iloc[i2]
-    if abs(h1 - h2) / max(h1, h2, 1e-9) > 0.008:
+    if abs(h1 - h2) / max(h1, h2, 1e-9) > 0.009:
         return False
     neckline = float(lows.iloc[i1 : i2 + 1].min())
     return float(closes.iloc[-1]) < neckline * 0.999
 
 
-def _is_bull_flag(c20: pd.DataFrame) -> bool:
-    """Bull flag: strong up move then tight consolidation."""
-
-    if len(c20) < 20:
+def _is_head_shoulders(c50: pd.DataFrame) -> bool:
+    highs = c50["high"].to_numpy(dtype=float)
+    if len(highs) < 25:
         return False
+    p = _pivot_high_idx(highs)
+    if len(p) < 3:
+        return False
+    ls, hd, rs = p[-3], p[-2], p[-1]
+    h_ls, h_hd, h_rs = highs[ls], highs[hd], highs[rs]
+    shoulders_close = abs(h_ls - h_rs) / max(h_ls, h_rs, 1e-9) <= 0.015
+    return shoulders_close and h_hd > h_ls and h_hd > h_rs
+
+
+def _is_inverse_head_shoulders(c50: pd.DataFrame) -> bool:
+    lows = c50["low"].to_numpy(dtype=float)
+    if len(lows) < 25:
+        return False
+    p = _pivot_low_idx(lows)
+    if len(p) < 3:
+        return False
+    ls, hd, rs = p[-3], p[-2], p[-1]
+    l_ls, l_hd, l_rs = lows[ls], lows[hd], lows[rs]
+    shoulders_close = abs(l_ls - l_rs) / max(l_ls, l_rs, 1e-9) <= 0.015
+    return shoulders_close and l_hd < l_ls and l_hd < l_rs
+
+
+def _is_bull_flag(c20: pd.DataFrame) -> bool:
     part1 = c20.iloc[:8]
     part2 = c20.iloc[8:]
     pole_move = (_safe_float(part1["close"].iloc[-1]) - _safe_float(part1["open"].iloc[0])) / max(_safe_float(part1["open"].iloc[0]), 1e-9)
     flag_range = (_safe_float(part2["high"].max()) - _safe_float(part2["low"].min())) / max(_safe_float(c20["close"].iloc[-1]), 1e-9)
     flag_slope = (_safe_float(part2["close"].iloc[-1]) - _safe_float(part2["close"].iloc[0])) / max(_safe_float(part2["close"].iloc[0]), 1e-9)
-    return pole_move >= 0.02 and flag_range <= 0.03 and -0.03 <= flag_slope <= 0.01
+    return pole_move >= 0.02 and flag_range <= 0.035 and -0.03 <= flag_slope <= 0.01
 
 
 def _is_bear_flag(c20: pd.DataFrame) -> bool:
-    """Bear flag: strong down move then tight consolidation."""
-
-    if len(c20) < 20:
-        return False
     part1 = c20.iloc[:8]
     part2 = c20.iloc[8:]
     pole_move = (_safe_float(part1["close"].iloc[-1]) - _safe_float(part1["open"].iloc[0])) / max(_safe_float(part1["open"].iloc[0]), 1e-9)
     flag_range = (_safe_float(part2["high"].max()) - _safe_float(part2["low"].min())) / max(_safe_float(c20["close"].iloc[-1]), 1e-9)
     flag_slope = (_safe_float(part2["close"].iloc[-1]) - _safe_float(part2["close"].iloc[0])) / max(_safe_float(part2["close"].iloc[0]), 1e-9)
-    return pole_move <= -0.02 and flag_range <= 0.03 and -0.01 <= flag_slope <= 0.03
+    return pole_move <= -0.02 and flag_range <= 0.035 and -0.01 <= flag_slope <= 0.03
+
+
+def _is_ascending_triangle(c50: pd.DataFrame) -> bool:
+    highs = c50["high"].tail(20).to_numpy(dtype=float)
+    lows = c50["low"].tail(20).to_numpy(dtype=float)
+    if len(highs) < 20:
+        return False
+    res_band = np.std(highs[-8:]) / max(np.mean(highs[-8:]), 1e-9)
+    rising_lows = np.polyfit(np.arange(len(lows)), lows, 1)[0] > 0
+    return res_band < 0.005 and rising_lows
+
+
+def _is_descending_triangle(c50: pd.DataFrame) -> bool:
+    highs = c50["high"].tail(20).to_numpy(dtype=float)
+    lows = c50["low"].tail(20).to_numpy(dtype=float)
+    if len(lows) < 20:
+        return False
+    sup_band = np.std(lows[-8:]) / max(np.mean(lows[-8:]), 1e-9)
+    falling_highs = np.polyfit(np.arange(len(highs)), highs, 1)[0] < 0
+    return sup_band < 0.005 and falling_highs
+
+
+def _is_symmetrical_triangle(c50: pd.DataFrame) -> str | None:
+    highs = c50["high"].tail(20).to_numpy(dtype=float)
+    lows = c50["low"].tail(20).to_numpy(dtype=float)
+    closes = c50["close"].tail(20).to_numpy(dtype=float)
+    if len(highs) < 20:
+        return None
+    high_slope = np.polyfit(np.arange(len(highs)), highs, 1)[0]
+    low_slope = np.polyfit(np.arange(len(lows)), lows, 1)[0]
+    if not (high_slope < 0 and low_slope > 0):
+        return None
+    top_line = highs.max()
+    bot_line = lows.min()
+    if closes[-1] > top_line * 0.998:
+        return "BULLISH"
+    if closes[-1] < bot_line * 1.002:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _is_rising_wedge(c50: pd.DataFrame) -> bool:
+    highs = c50["high"].tail(25).to_numpy(dtype=float)
+    lows = c50["low"].tail(25).to_numpy(dtype=float)
+    if len(highs) < 25:
+        return False
+    hs = np.polyfit(np.arange(len(highs)), highs, 1)[0]
+    ls = np.polyfit(np.arange(len(lows)), lows, 1)[0]
+    narrowing = (highs[-1] - lows[-1]) < (highs[0] - lows[0])
+    return hs > 0 and ls > 0 and ls > hs and narrowing
+
+
+def _is_falling_wedge(c50: pd.DataFrame) -> bool:
+    highs = c50["high"].tail(25).to_numpy(dtype=float)
+    lows = c50["low"].tail(25).to_numpy(dtype=float)
+    if len(highs) < 25:
+        return False
+    hs = np.polyfit(np.arange(len(highs)), highs, 1)[0]
+    ls = np.polyfit(np.arange(len(lows)), lows, 1)[0]
+    narrowing = (highs[-1] - lows[-1]) < (highs[0] - lows[0])
+    return hs < 0 and ls < 0 and hs > ls and narrowing
+
+
+def _is_cup_handle(c50: pd.DataFrame) -> bool:
+    if len(c50) < 35:
+        return False
+    closes = c50["close"].to_numpy(dtype=float)
+    left = closes[:20]
+    handle = closes[-10:]
+    trough_idx = int(np.argmin(left))
+    left_ok = trough_idx > 4 and trough_idx < 16
+    rim_close = max(left[0], left[-1])
+    cup_depth = (rim_close - left[trough_idx]) / max(rim_close, 1e-9)
+    handle_pullback = (max(handle) - min(handle)) / max(max(handle), 1e-9)
+    return left_ok and 0.02 <= cup_depth <= 0.2 and handle_pullback <= 0.03 and closes[-1] >= np.percentile(left, 80)
 
 
 def _is_hh_hl(c20: pd.DataFrame) -> bool:
-    """Higher highs and higher lows confirmation."""
-
     highs = c20["high"].tail(6).to_numpy(dtype=float)
     lows = c20["low"].tail(6).to_numpy(dtype=float)
-    if len(highs) < 6 or len(lows) < 6:
+    if len(highs) < 6:
         return False
-    hh_hits = int((np.diff(highs) > 0).sum())
-    hl_hits = int((np.diff(lows) > 0).sum())
-    return hh_hits >= 4 and hl_hits >= 4
+    return int((np.diff(highs) > 0).sum()) >= 4 and int((np.diff(lows) > 0).sum()) >= 4
 
 
 def _is_lh_ll(c20: pd.DataFrame) -> bool:
-    """Lower highs and lower lows confirmation."""
-
     highs = c20["high"].tail(6).to_numpy(dtype=float)
     lows = c20["low"].tail(6).to_numpy(dtype=float)
-    if len(highs) < 6 or len(lows) < 6:
+    if len(highs) < 6:
         return False
-    lh_hits = int((np.diff(highs) < 0).sum())
-    ll_hits = int((np.diff(lows) < 0).sum())
-    return lh_hits >= 4 and ll_hits >= 4
+    return int((np.diff(highs) < 0).sum()) >= 4 and int((np.diff(lows) < 0).sum()) >= 4
 
 
-def _short_trend_bias(window: pd.DataFrame) -> str:
-    """Short trend bias from close slope in 15m candles."""
+def _is_volume_climax(df: pd.DataFrame) -> bool:
+    if "volume" not in df.columns or len(df) < 20:
+        return False
+    vol = df["volume"].tail(20)
+    return _safe_float(vol.iloc[-1]) > (_safe_float(vol.mean()) * 2.5)
 
-    if window is None or window.empty or len(window) < 5:
-        return "NEUTRAL"
-    first = _safe_float(window["close"].iloc[0])
-    last = _safe_float(window["close"].iloc[-1])
-    move = (last - first) / max(first, 1e-9)
-    if move > 0.008:
+
+def _is_volume_divergence(df: pd.DataFrame) -> bool:
+    if "volume" not in df.columns or len(df) < 12:
+        return False
+    close = df["close"].tail(12).to_numpy(dtype=float)
+    vol = df["volume"].tail(12).to_numpy(dtype=float)
+    close_slope = np.polyfit(np.arange(len(close)), close, 1)[0]
+    vol_slope = np.polyfit(np.arange(len(vol)), vol, 1)[0]
+    return (close_slope > 0 and vol_slope < 0) or (close_slope < 0 and vol_slope > 0)
+
+
+def _breakout_with_volume(df: pd.DataFrame) -> str | None:
+    if "volume" not in df.columns or len(df) < 25:
+        return None
+    closes = df["close"].tail(21)
+    highs = df["high"].tail(21)
+    lows = df["low"].tail(21)
+    vol = df["volume"].tail(21)
+    prior_high = _safe_float(highs.iloc[:-1].max())
+    prior_low = _safe_float(lows.iloc[:-1].min())
+    last_close = _safe_float(closes.iloc[-1])
+    vol_ok = _safe_float(vol.iloc[-1]) >= (_safe_float(vol.iloc[:-1].mean()) * 1.5)
+    if not vol_ok:
+        return None
+    if last_close > prior_high:
         return "BULLISH"
-    if move < -0.008:
+    if last_close < prior_low:
         return "BEARISH"
-    return "NEUTRAL"
+    return None
+
+
+def _pivot_high_idx(arr: np.ndarray) -> List[int]:
+    idx: List[int] = []
+    for i in range(1, len(arr) - 1):
+        if arr[i] >= arr[i - 1] and arr[i] >= arr[i + 1]:
+            idx.append(i)
+    return idx
+
+
+def _pivot_low_idx(arr: np.ndarray) -> List[int]:
+    idx: List[int] = []
+    for i in range(1, len(arr) - 1):
+        if arr[i] <= arr[i - 1] and arr[i] <= arr[i + 1]:
+            idx.append(i)
+    return idx
 
 
 def _timeframe_bias(h1_df: pd.DataFrame) -> str:
@@ -534,15 +930,3 @@ def _timeframe_bias(h1_df: pd.DataFrame) -> str:
     if close < ema21 and ema9 <= ema21 and macd_hist <= 0 and _is_lh_ll(h1_df.tail(20)):
         return "BEARISH"
     return "NEUTRAL"
-
-
-def _doji_direction(trend_hint: str, h1_bias: str) -> str:
-    """Map neutral doji into directional context."""
-
-    if trend_hint == "BEARISH":
-        return "BULLISH"
-    if trend_hint == "BULLISH":
-        return "BEARISH"
-    if h1_bias in {"BULLISH", "BEARISH"}:
-        return h1_bias
-    return "BULLISH"

@@ -13,3 +13,6 @@ numpy
 websockets
 praw
 requests
+smartapi-python
+pyotp
+logzero

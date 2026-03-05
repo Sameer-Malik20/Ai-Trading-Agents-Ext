@@ -34,6 +34,7 @@ class DataContext:
     warnings: List[str] = field(default_factory=list)
     validation: Dict[str, Any] = field(default_factory=dict)
     nifty_correlation: float = 0.0
+    gap_info: Dict[str, Any] = field(default_factory=dict)
 
 
 def run(symbol: str) -> Dict[str, Any]:
@@ -53,6 +54,7 @@ def run(symbol: str) -> Dict[str, Any]:
         warnings.extend(prep_notes)
         corr = estimate_index_correlation(frames.get("1d", pd.DataFrame()), nifty)
         price = float(live.get("last_price") or 0.0)
+        gap_info = _compute_opening_gap(frames.get("5m", pd.DataFrame()), frames.get("1d", pd.DataFrame()))
 
         ctx = DataContext(
             symbol=norm,
@@ -67,6 +69,7 @@ def run(symbol: str) -> Dict[str, Any]:
             warnings=warnings,
             validation=validation,
             nifty_correlation=corr,
+            gap_info=gap_info,
         )
         return {"ok": True, "data_context": ctx, "agent_output": _context_summary(ctx)}
     except Exception as exc:
@@ -192,6 +195,7 @@ def _build_degraded(symbol: str, reason: str) -> DataContext:
         warnings=["Degraded mode active due to data fetch failure."],
         validation={"timeframes": {}, "score_components": {}},
         nifty_correlation=0.0,
+        gap_info={"gap_percent": 0.0, "gap_type": "UNKNOWN", "gap_direction": "FLAT", "opening_gap_gate_recommended": True},
     )
 
 
@@ -208,6 +212,72 @@ def _context_summary(ctx: DataContext) -> Dict[str, Any]:
         "errors": ctx.errors,
         "warnings": ctx.warnings,
         "nifty_correlation": round(float(ctx.nifty_correlation), 4),
+        "gap_info": ctx.gap_info,
         "validation": ctx.validation,
         "candle_counts": {k: int(len(v)) for k, v in ctx.timeframes.items()},
     }
+
+
+def _compute_opening_gap(df_5m: pd.DataFrame, df_1d: pd.DataFrame) -> Dict[str, Any]:
+    """Compute opening gap percentage and classify today's opening context."""
+
+    default = {
+        "gap_percent": 0.0,
+        "gap_type": "UNKNOWN",
+        "gap_direction": "FLAT",
+        "today_open": 0.0,
+        "previous_close": 0.0,
+        "opening_gap_gate_recommended": True,
+    }
+    try:
+        if df_5m is None or df_5m.empty or df_1d is None or df_1d.empty:
+            return default
+
+        intraday = df_5m.dropna(subset=["open"]).sort_index()
+        daily = df_1d.dropna(subset=["close"]).sort_index()
+        if intraday.empty or len(daily) < 2:
+            return default
+
+        latest_trade_date = intraday.index[-1].date() if isinstance(intraday.index, pd.DatetimeIndex) else None
+        if latest_trade_date is None:
+            return default
+
+        today_rows = intraday[intraday.index.date == latest_trade_date]
+        if today_rows.empty:
+            return default
+        today_open = float(today_rows.iloc[0]["open"])
+
+        prev_daily = daily[daily.index.date < latest_trade_date] if isinstance(daily.index, pd.DatetimeIndex) else daily.iloc[:-1]
+        if prev_daily.empty:
+            prev_close = float(daily.iloc[-2]["close"])
+        else:
+            prev_close = float(prev_daily.iloc[-1]["close"])
+        if prev_close == 0:
+            return default
+
+        gap_pct = ((today_open - prev_close) / prev_close) * 100.0
+        gap_type, gap_direction = _classify_gap(gap_pct)
+        return {
+            "gap_percent": round(float(gap_pct), 4),
+            "gap_type": gap_type,
+            "gap_direction": gap_direction,
+            "today_open": round(today_open, 4),
+            "previous_close": round(prev_close, 4),
+            "opening_gap_gate_recommended": abs(gap_pct) <= 0.5,
+        }
+    except Exception:
+        return default
+
+
+def _classify_gap(gap_pct: float) -> tuple[str, str]:
+    """Map gap percent into configured classes."""
+
+    if gap_pct > 1.0:
+        return "STRONG_GAP_UP", "UP"
+    if gap_pct > 0.5:
+        return "GAP_UP", "UP"
+    if gap_pct < -1.0:
+        return "STRONG_GAP_DOWN", "DOWN"
+    if gap_pct < -0.5:
+        return "GAP_DOWN", "DOWN"
+    return "FLAT_OPEN", "FLAT"
